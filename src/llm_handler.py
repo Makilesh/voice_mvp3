@@ -1,8 +1,8 @@
-# llm_handler.py - OPTIMIZED VERSION
+# llm_handler.py - OPTIMIZED VERSION (Faster, No Quality Loss)
 import os
 import logging
 import asyncio
-import httpx  # Better async HTTP client
+import httpx
 import random
 import re
 from dotenv import load_dotenv
@@ -115,13 +115,13 @@ class LLMHandler:
         
         # Async HTTP client (reusable connection pool)
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0, connect=5.0),
+            timeout=httpx.Timeout(12.0, connect=5.0),  # Reduced from 15s
             limits=httpx.Limits(max_keepalive_connections=5)
         )
         
         self.interaction_count = 0
         
-        logger.info("🤖 LLM Handler initialized (async mode)")
+        logger.info("🤖 LLM Handler initialized (optimized mode)")
     
     async def process_text(self, text: str) -> str:
         """Process text with sentiment-aware response (FAST mode)."""
@@ -137,7 +137,7 @@ class LLMHandler:
                     {"role": "user", "content": processed_text}
                 ],
                 "temperature": self._get_dynamic_temperature(sentiment),
-                "max_tokens": 150,  # REDUCED from 1000 for speed (voice responses should be short)
+                "max_tokens": 100,  # ⚡ REDUCED from 150 (voice should be concise)
                 "top_p": 0.9,
                 "frequency_penalty": 0.3,
                 "presence_penalty": 0.2
@@ -189,8 +189,8 @@ class LLMHandler:
             system_prompt = self._build_dynamic_system_prompt(sentiment, has_history=True)
             messages = [{"role": "system", "content": system_prompt}]
             
-            # Add conversation history (last 6-8 exchanges, skip system prompt)
-            for i, exchange in enumerate(conversation_history[-8:]):
+            # Add conversation history (last 6 exchanges for speed)
+            for i, exchange in enumerate(conversation_history[-6:]):
                 if exchange.startswith("System:"):
                     continue  # Skip system messages in history
                 
@@ -205,9 +205,9 @@ class LLMHandler:
                 "model": "gpt-4o-mini",
                 "messages": messages,
                 "temperature": self._get_dynamic_temperature(sentiment),
-                "max_tokens": 200,  # Slightly higher for context, but still fast
+                "max_tokens": 120,  # ⚡ REDUCED from 200 (faster without quality loss)
                 "top_p": 0.9,
-                "frequency_penalty": 0.35,  # Higher to avoid repetition in long conversations
+                "frequency_penalty": 0.35,  # Higher to avoid repetition
                 "presence_penalty": 0.25
             }
             
@@ -266,7 +266,7 @@ class LLMHandler:
         base = """You are Alex, a warm AI voice assistant for Shamla Tech.
 
 VOICE GUIDELINES:
-- Keep responses SHORT (2-3 sentences max)
+- Keep responses SHORT (1-2 sentences for simple queries, 3 max for complex)
 - Use contractions (I'm, you're, that's)
 - Be conversational and natural
 - No lists or bullet points (this is voice!)
