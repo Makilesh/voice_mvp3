@@ -1,12 +1,13 @@
-# main.py
+# main.py - OPTIMIZED VERSION
 from stt_handler import STTHandler
 from llm_handler import LLMHandler
 from tts_handler import TTSHandler
 import asyncio
 import logging
 import warnings
+import time
 
-warnings.filterwarnings("ignore", category=DeprecationWarning, message="pkg_resources is deprecated")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,143 +15,271 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-async def handle_conversation_turn(stt_handler, llm_handler, tts_handler, conversation_history):
-    """Handle a single turn in the conversation."""
+class ConversationManager:
+    """Manages conversation state and error recovery."""
+    
+    def __init__(self, max_history: int = 10):
+        self.history = []
+        self.max_history = max_history
+        self.turn_count = 0
+        self.error_count = 0
+        self.max_consecutive_errors = 3
+    
+    def add_turn(self, role: str, content: str):
+        """Add conversation turn with automatic pruning."""
+        self.history.append(f"{role}: {content}")
+        if len(self.history) > self.max_history:
+            # Keep system prompt + recent history
+            self.history = [self.history[0]] + self.history[-(self.max_history-1):]
+        self.turn_count += 1
+    
+    def get_history(self) -> list:
+        """Get conversation history."""
+        return self.history.copy()
+    
+    def record_error(self):
+        """Track consecutive errors."""
+        self.error_count += 1
+    
+    def reset_errors(self):
+        """Reset error counter on success."""
+        self.error_count = 0
+    
+    def should_abort(self) -> bool:
+        """Check if too many consecutive errors."""
+        return self.error_count >= self.max_consecutive_errors
+
+
+async def handle_conversation_turn(stt_handler, llm_handler, tts_handler, 
+                                   conversation_manager) -> tuple[bool, bool]:
+    """
+    Handle a single conversation turn with optimized flow.
+    
+    Returns:
+        (should_continue, should_exit)
+    """
     try:
-        logger.info("🎤 Waiting for your speech...")
-        print("\n🎤 Speak now... (The system is listening)")
+        turn_start = time.time()
         
-        # Get the transcription (this will wait for speech)
+        # Step 1: Get user input (STT)
+        logger.info("🎤 Listening for speech...")
+        print("\n🎤 Speak now...")
+        
         user_text = await stt_handler.get_transcription()
         
         if not user_text:
-            logger.warning("⚠️ No speech detected.")
+            logger.warning("⚠️ No speech detected")
             print("❌ No speech detected. Please try again.")
-            return False
+            conversation_manager.record_error()
+            return True, False
         
-        print(f"📝 You said: {user_text}")
+        stt_time = time.time() - turn_start
+        print(f"📝 You: {user_text} ({stt_time*1000:.0f}ms)")
         
-        # Add to conversation history
-        conversation_history.append(f"User: {user_text}")
+        # Check for exit commands
+        if user_text.strip().lower() in ['quit', 'exit', 'goodbye', 'bye']:
+            return False, True
         
-        # Exit if user says quit/exit
-        if user_text.strip().lower() in ['quit', 'exit', 'q']:
-            return True
+        # Add to history
+        conversation_manager.add_turn("User", user_text)
         
-        # Process with LLM
-        logger.info("🤖 AI is thinking...")
-        response = await llm_handler.process_text_with_history(user_text, conversation_history)
+        # Step 2: Get AI response (LLM)
+        llm_start = time.time()
+        logger.info("🤖 Generating response...")
         
-        print(f"🤖 Shamla Tech Agent: {response}")
+        response = await llm_handler.process_text_with_history(
+            user_text, 
+            conversation_manager.get_history()
+        )
         
-        # Add to conversation history
-        conversation_history.append(f"Agent: {response}")
+        llm_time = time.time() - llm_start
         
-        # Speak the response with barge-in enabled
-        logger.info("🗣 Agent is speaking...")
-        tts_handler.speak(response, voice="default", emotive_tags="", enable_barge_in=True)
+        if not response or len(response.strip()) < 3:
+            logger.error("❌ Invalid LLM response")
+            response = "I'm sorry, I didn't quite catch that. Could you repeat?"
+            conversation_manager.record_error()
+        else:
+            conversation_manager.reset_errors()
+        
+        print(f"🤖 Agent: {response} ({llm_time*1000:.0f}ms)")
+        conversation_manager.add_turn("Agent", response)
+        
+        # Step 3: Speak response (TTS)
+        tts_start = time.time()
+        logger.info("🗣 Speaking response...")
+        
+        tts_handler.speak(response, enable_barge_in=True)
         
         # Wait for completion or barge-in
         completed = tts_handler.wait_for_completion(timeout=30.0)
         
-        if tts_handler.is_barge_in_detected():
-            print("🎤 Barge-in detected! You interrupted the AI.")
-            # Add the interruption to conversation history
-            conversation_history.append("User: [Interrupted AI]")
-            # Immediately start next turn (recursive call)
-            return await handle_conversation_turn(stt_handler, llm_handler, tts_handler, conversation_history)
+        tts_time = time.time() - tts_start
+        total_time = time.time() - turn_start
         
-        return completed
+        # Log performance
+        logger.info(f"⏱ Turn timing: STT={stt_time*1000:.0f}ms, "
+                   f"LLM={llm_time*1000:.0f}ms, TTS={tts_time*1000:.0f}ms, "
+                   f"Total={total_time*1000:.0f}ms")
+        
+        # Check for barge-in
+        if tts_handler.is_barge_in_detected():
+            print("🎤 You interrupted! Processing your input...")
+            conversation_manager.add_turn("System", "[User interrupted]")
+            # Continue to next turn (user already spoke)
+            return True, False
+        
+        # Performance warning
+        if total_time > 3.0:
+            logger.warning(f"⚠️ Slow turn detected: {total_time:.1f}s")
+        
+        return True, False
         
     except Exception as e:
-        logger.error(f"❌ Error in conversation turn: {e}")
-        print(f"❌ An error occurred: {e}")
-        return False
+        logger.error(f"❌ Turn error: {e}", exc_info=True)
+        conversation_manager.record_error()
+        
+        if conversation_manager.should_abort():
+            print("❌ Too many errors. Exiting for safety.")
+            return False, True
+        
+        print("❌ An error occurred. Continuing...")
+        return True, False
+
 
 async def main():
-    """Main function to run the conversational voice processing pipeline."""
-    logger.info("🚀 Starting conversational voice processing pipeline...")
+    """Main conversation loop with robust error handling."""
+    logger.info("🚀 Starting AI Voice Agent...")
+    
+    stt_handler = None
+    tts_handler = None
     
     try:
-        # Initialize the handlers
+        # Step 1: Initialize handlers
         logger.info("🔧 Initializing handlers...")
-        stt_handler = STTHandler()
-        llm_handler = LLMHandler()
+        print("=" * 50)
+        print("🎙 Shamla Tech AI Voice Assistant")
+        print("=" * 50)
+        print("Initializing... Please wait.")
         
-        # FIX: Start STT listening BEFORE creating TTS
+        # Initialize STT first (balanced mode for best speed/accuracy)
+        stt_handler = STTHandler(mode="balanced")
         await stt_handler.start_listening()
         
-        # FIX: Pass shared STT instance to TTS handler
+        # Initialize LLM
+        llm_handler = LLMHandler()
+        
+        # Initialize TTS with shared STT
         tts_handler = TTSHandler(stt_handler=stt_handler)
         
-        # Initialize conversation history
-        conversation_history = [
-            "System: You are an AI voice calling agent for Shamla Tech. Shamla Tech provides AI, blockchain, and cryptocurrency services. Be professional, helpful, and informative. Ask clarifying questions to better assist customers."
-        ]
+        # Initialize conversation manager
+        conversation_manager = ConversationManager(max_history=12)
+        conversation_manager.add_turn(
+            "System",
+            "You are Alex, an AI voice assistant for Shamla Tech. "
+            "Shamla Tech provides AI, blockchain, and cryptocurrency services. "
+            "Be warm, helpful, and conversational. Keep responses concise for voice."
+        )
         
-        # Welcome message
-        welcome_message = "Hello! Thank you for calling Shamla Tech! I'm your AI assistant. How can I help you today?"
-        print(f"🤖 Shamla Tech Agent: {welcome_message}")
-        conversation_history.append(f"Agent: {welcome_message}")
+        print("✅ System ready!")
         
-        # Speak the welcome message
-        logger.info("🗣 Speaking welcome message...")
-        tts_handler.speak(welcome_message, voice="default", emotive_tags="")
+        # Step 2: Welcome message
+        welcome = "Hello! Thank you for calling Shamla Tech. I'm Alex, your AI assistant. How can I help you today?"
+        print(f"\n🤖 Agent: {welcome}")
+        conversation_manager.add_turn("Agent", welcome)
         
-        # Main conversation loop
-        print("\n💡 Conversation Tips:")
-        print("- Speak clearly and pause briefly between sentences")
-        print("- Say 'quit' or 'exit' to end the conversation")
-        print("- Say 'help' for assistance")
+        tts_handler.speak(welcome, enable_barge_in=False)  # Don't allow barge-in on welcome
+        tts_handler.wait_for_completion(timeout=15.0)
+        
+        # Step 3: Main conversation loop
+        print("\n💡 Tips:")
+        print("- Speak naturally and clearly")
+        print("- You can interrupt the AI by speaking")
+        print("- Say 'quit' or 'goodbye' to exit")
         print()
         
-        while True:
-            # Voice-driven loop: handle a conversation turn
-            result = await handle_conversation_turn(stt_handler, llm_handler, tts_handler, conversation_history)
-            
-            # If user said quit/exit, break
-            if result is True and conversation_history[-1].lower().startswith("user: "):
-                last_user = conversation_history[-1][6:].strip().lower()
-                if last_user in ['quit', 'exit', 'q']:
-                    print("👋 Thank you for calling Shamla Tech! Have a great day!")
-                    break
-            
-            if not result:
-                print("❌ There was an error processing your input. Please try again.")
-                continue
+        loop_count = 0
+        max_turns = 50  # Safety limit
         
-        logger.info("✅ Conversation completed successfully!")
+        while loop_count < max_turns:
+            loop_count += 1
+            
+            should_continue, should_exit = await handle_conversation_turn(
+                stt_handler, llm_handler, tts_handler, conversation_manager
+            )
+            
+            if should_exit:
+                print("\n👋 Thank you for calling Shamla Tech! Have a great day!")
+                break
+            
+            if not should_continue:
+                break
+            
+            # Brief pause between turns
+            await asyncio.sleep(0.1)
+        
+        if loop_count >= max_turns:
+            print("\n⏰ Session limit reached. Thank you for using Shamla Tech!")
+        
+        # Print session stats
+        stats = stt_handler.get_performance_stats()
+        print(f"\n📊 Session Stats:")
+        print(f"   Turns: {conversation_manager.turn_count}")
+        print(f"   Transcriptions: {stats['transcription_count']}")
+        print(f"   Avg STT Latency: {stats['avg_latency_ms']}ms")
+        
+        logger.info("✅ Conversation completed successfully")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️ Interrupted by user")
+        logger.info("User interrupt detected")
         
     except Exception as e:
-        logger.error(f"❌ Error in conversation pipeline: {e}")
-        print(f"❌ An error occurred: {e}")
-    
+        logger.error(f"❌ Fatal error: {e}", exc_info=True)
+        print(f"\n❌ Fatal error: {e}")
+        print("Please check logs and restart the system.")
+        
     finally:
-        # Cleanup
+        # Step 4: Cleanup (always runs)
         logger.info("🧹 Cleaning up...")
-        if 'tts_handler' in locals():
-            tts_handler.shutdown()
-        if 'stt_handler' in locals():
-            try:
+        print("\n🧹 Shutting down...")
+        
+        try:
+            if tts_handler:
+                tts_handler.shutdown()
+        except Exception as e:
+            logger.error(f"TTS cleanup error: {e}")
+        
+        try:
+            if stt_handler:
                 await stt_handler.stop_listening()
-            except Exception:
-                pass
+        except Exception as e:
+            logger.error(f"STT cleanup error: {e}")
+        
+        print("✅ Shutdown complete")
+        logger.info("✅ System shutdown complete")
+
 
 if __name__ == "__main__":
-    print("🎙 Shamla Tech AI Voice Assistant")
-    print("=" * 50)
-    print("Professional AI Voice Calling Agent")
-    print("Services: AI, Blockchain, Cryptocurrency")
-    print("=" * 50)
-    print("Make sure you have:")
-    print("1. Microphone access")
-    print("2. OPENAI_API_KEY set in your .env file")
-    print("3. Required dependencies installed")
-    print("=" * 50)
+    print("""
+╔═══════════════════════════════════════════════════╗
+║     🎙 Shamla Tech AI Voice Assistant v2.0       ║
+║     Optimized for Real-Time Performance           ║
+╚═══════════════════════════════════════════════════╝
+
+Prerequisites:
+1. Microphone access
+2. OPENAI_API_KEY in .env file
+3. Python dependencies installed
+
+Starting in 3 seconds...
+""")
+    
+    time.sleep(3)
     
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Voice processing interrupted by user.")
+        print("\n👋 Goodbye!")
     except Exception as e:
-        print(f"❌ Fatal error: {e}")
+        print(f"\n❌ Startup error: {e}")
+        logger.error(f"Startup failed: {e}", exc_info=True)
