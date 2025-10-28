@@ -5,6 +5,7 @@ import asyncio
 import warnings
 import concurrent.futures
 import re
+import threading
 from RealtimeSTT import AudioToTextRecorder
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -48,6 +49,9 @@ class STTHandler:
         
         # Adaptive quality: Start fast, upgrade if needed
         self.model_name = self._select_model(mode)
+        # Real-time transcription tracking
+        self.realtime_text = ""
+        self.realtime_lock = threading.Lock()
         
         logger.info(f"🎤 STT Handler initialized (mode: {mode}, model: {self.model_name})")
     
@@ -77,10 +81,22 @@ class STTHandler:
         
         return text.strip()
     
+    def _on_realtime_update(self, text: str):
+        """Callback for real-time transcription updates."""
+        with self.realtime_lock:
+            self.realtime_text = text
+        # Don't log here (too noisy)
+        
     async def start_listening(self):
         """Start optimized continuous listening."""
         try:
             def init_recorder():
+                 # Capture self reference for callback
+                handler_self = self
+                
+                def on_realtime_update(text: str):
+                    handler_self._on_realtime_update(text)
+                
                 return AudioToTextRecorder(
                     # CRITICAL: Optimized model selection
                     model=self.model_name,
@@ -89,11 +105,12 @@ class STTHandler:
                     
                     # Real-time transcription (essential for low latency)
                     enable_realtime_transcription=True,
+                    on_realtime_transcription_update=on_realtime_update,  # ADD THIS
                     realtime_model_type=self.model_name,
                     
                     # ⚡ OPTIMIZED TIMING (balanced for speed + naturalness)
                     realtime_processing_pause=0.08,  # 80ms (was 0.1s) - slightly faster
-                    post_speech_silence_duration=0.3,  # 300ms (was 0.4s) - FASTER by 25%
+                    post_speech_silence_duration=0.25,  # 300ms (was 0.4s) - FASTER by 25%
                     min_length_of_recording=0.3,  # Catch short utterances
                     min_gap_between_recordings=0.08,  # Quick turn-taking
                     
@@ -189,7 +206,14 @@ class STTHandler:
             "avg_latency_ms": round(self.avg_latency, 1),
             "is_listening": self.is_listening
         }
-
+    def get_realtime_text(self) -> str:
+        """Get current real-time transcription (non-blocking)."""
+        try:
+            if self.recorder and hasattr(self.recorder, 'realtime_stabilized_text'):
+                return self.recorder.realtime_stabilized_text or ""
+            return ""
+        except Exception:
+            return ""
 
 async def main():
     """Test STT with performance monitoring."""

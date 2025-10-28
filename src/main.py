@@ -110,6 +110,20 @@ async def handle_conversation_turn(stt_handler, llm_handler, tts_handler,
         
         tts_handler.speak(response, enable_barge_in=True)
         
+        # Monitor for barge-in during TTS
+        barge_in_start_check = time.time()
+        last_rt_text = ""
+        
+        # Poll for real-time transcription while TTS is playing
+        while tts_handler.is_playing:
+            if time.time() - barge_in_start_check > 0.1:  # Check every 100ms
+                rt_text = stt_handler.get_realtime_text()
+                if rt_text and rt_text != last_rt_text and len(rt_text) > 2:
+                    logger.info(f"🎤 Real-time detected during TTS: {rt_text}")
+                    last_rt_text = rt_text
+                barge_in_start_check = time.time()
+            
+            await asyncio.sleep(0.05)  # 50ms polling
         # Wait for completion or barge-in
         completed = tts_handler.wait_for_completion(timeout=30.0)
         
