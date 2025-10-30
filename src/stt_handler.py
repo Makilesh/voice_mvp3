@@ -1,4 +1,4 @@
-# stt_handler.py 
+# stt_handler.py old
 from datetime import datetime
 import logging
 import asyncio
@@ -6,6 +6,7 @@ import warnings
 import concurrent.futures
 import re
 import threading
+import time
 from RealtimeSTT import AudioToTextRecorder
 
 from datetime import datetime
@@ -14,6 +15,7 @@ import asyncio
 import concurrent.futures
 import re
 import threading
+import time
 from RealtimeSTT import AudioToTextRecorder
 
 # Configure logging
@@ -53,6 +55,12 @@ class STTHandler:
         self.completed_transcriptions = asyncio.Queue()
         self.last_completed_text = ""
         
+        # CRITICAL: Polling state for barge-in detection
+        self.polling_text = ""
+        self.polling_lock = threading.Lock()
+        self.polling_active = False
+        self.polling_thread = None
+        
         logger.info(f"🎤 STT Handler initialized (FULL-DUPLEX mode: {mode}, model: {self.model_name})")
     
     def _select_model(self, mode: str) -> str:
@@ -80,6 +88,9 @@ class STTHandler:
         """CRITICAL: Called continuously during speech (non-blocking)."""
         with self.realtime_lock:
             self.realtime_text = text
+        # Debug logging
+        if text and text.strip():
+            logger.debug(f"🎤 Real-time update: '{text.strip()}'")
     
     def _on_transcription_complete(self, text: str):
         """CRITICAL: Called when speech segment completes (non-blocking)."""
@@ -101,6 +112,8 @@ class STTHandler:
                 def on_transcription_complete(text: str):
                     handler_self._on_transcription_complete(text)
                 
+                logger.info("🎤 Initializing AudioToTextRecorder...")
+                
                 return AudioToTextRecorder(
                     model=self.model_name,
                     language="en",
@@ -109,24 +122,26 @@ class STTHandler:
                     # CRITICAL: Enable real-time callbacks
                     enable_realtime_transcription=True,
                     on_realtime_transcription_update=on_realtime_update,
-                    # on_transcription_complete=on_transcription_complete,
                     realtime_model_type=self.model_name,
                     
-                    # OPTIMIZED timing
-                    realtime_processing_pause=0.08,
-                    post_speech_silence_duration=0.25,
-                    min_length_of_recording=0.3,
-                    min_gap_between_recordings=0.08,
-                    pre_recording_buffer_duration=0.15,
+                    # OPTIMIZED timing for real-time detection
+                    realtime_processing_pause=0.05,  # Faster processing
+                    post_speech_silence_duration=0.15,  # Shorter silence
+                    min_length_of_recording=0.2,  # Shorter minimum recording
+                    min_gap_between_recordings=0.05,  # Shorter gap
+                    pre_recording_buffer_duration=0.1,  # Shorter buffer
                     
-                    # VAD settings
-                    silero_sensitivity=0.5,
+                    # VAD settings - more sensitive
+                    silero_sensitivity=0.3,  # More sensitive
                     silero_use_onnx=True,
-                    webrtc_sensitivity=2,
+                    webrtc_sensitivity=1,  # More sensitive
                     
-                    beam_size=3,
+                    beam_size=1,  # Faster but less accurate
                     initial_prompt="Shamla Tech, AI, blockchain, cryptocurrency, API",
-                    use_microphone=True
+                    use_microphone=True,
+                    
+                    # Device settings
+                    device=None  # Use default device
                 )
             
             with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -149,6 +164,51 @@ class STTHandler:
         """Get current real-time transcription (INSTANT, non-blocking)."""
         with self.realtime_lock:
             return self.realtime_text
+    
+    def get_realtime_text_hybrid(self) -> str:
+        """Hybrid approach: Check real-time buffer, if empty do quick check."""
+        # First check the real-time buffer
+        with self.realtime_lock:
+            if self.realtime_text and len(self.realtime_text.strip()) > 0:
+                return self.realtime_text
+        
+        # If empty, try a quick non-blocking check
+        try:
+            # Save current state
+            old_last_text = self.last_completed_text
+            
+            # Try to get a quick transcription with very short timeout
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Create a task with timeout
+                try:
+                    # Use a small timeout to check if there's any speech
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(self._quick_speech_check)
+                        result = future.result(timeout=0.1)  # 100ms timeout
+                        if result:
+                            return result
+                except:
+                    pass
+            
+            return ""
+            
+        except Exception as e:
+            logger.debug(f"Hybrid check error: {e}")
+            return ""
+    
+    def _quick_speech_check(self) -> str:
+        """Quick speech check without blocking."""
+        try:
+            # Check if we have any recent audio activity
+            if hasattr(self, 'recorder') and self.recorder:
+                # This is a simplified check - in practice, you might need to
+                # check the recorder's internal state
+                return self.get_realtime_text()
+            return ""
+        except:
+            return ""
     
     def clear_realtime_text(self):
         """Clear real-time buffer."""
@@ -192,6 +252,13 @@ class STTHandler:
     async def stop_listening(self):
         """Stop listening and cleanup."""
         try:
+            # Stop polling if active
+            with self.polling_lock:
+                self.polling_active = False
+            
+            if self.polling_thread and self.polling_thread.is_alive():
+                self.polling_thread.join(timeout=1.0)
+            
             if self.recorder:
                 self.recorder = None
             self.is_listening = False
@@ -203,6 +270,79 @@ class STTHandler:
             logger.info("🎤 STT stopped")
         except Exception as e:
             logger.error(f"❌ Stop error: {e}")
+    
+    def start_polling_for_barge_in(self):
+        """Start background polling for barge-in detection."""
+        with self.polling_lock:
+            if self.polling_active:
+                return
+            
+            self.polling_active = True
+            self.polling_thread = threading.Thread(target=self._polling_worker, daemon=True)
+            self.polling_thread.start()
+            logger.info("🎤 Background polling thread started")
+    
+    def stop_polling_for_barge_in(self):
+        """Stop background polling."""
+        with self.polling_lock:
+            self.polling_active = False
+        logger.info("🎤 Background polling thread stopped")
+    
+    def get_barge_in_text(self) -> str:
+        """Get the latest text from polling (for barge-in detection)."""
+        with self.polling_lock:
+            return self.polling_text
+    
+    def _polling_worker(self):
+        """Background worker for polling STT."""
+        try:
+            logger.info("🎤 Polling worker started")
+            while self.polling_active:
+                try:
+                    # Use a simpler approach - check if recorder has any activity
+                    if hasattr(self, 'recorder') and self.recorder:
+                        # Try to get text with reasonable timeout
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                # Create a task with reasonable timeout
+                                future = asyncio.run_coroutine_threadsafe(
+                                    asyncio.wait_for(
+                                        self.get_transcription(),
+                                        timeout=2.0  # Give it time to detect speech
+                                    ),
+                                    loop
+                                )
+                                try:
+                                    result = future.result(timeout=3.0)
+                                    if result and len(result.strip()) > 0:
+                                        with self.polling_lock:
+                                            self.polling_text = result.strip()
+                                        logger.info(f"🎤 POLLING DETECTED: '{result.strip()}'")
+                                    else:
+                                        with self.polling_lock:
+                                            self.polling_text = ""
+                                except asyncio.TimeoutError:
+                                    # No speech detected in this cycle
+                                    with self.polling_lock:
+                                        self.polling_text = ""
+                                except Exception as e:
+                                    logger.debug(f"Polling future error: {e}")
+                                    with self.polling_lock:
+                                        self.polling_text = ""
+                        except Exception as e:
+                            logger.debug(f"Polling error: {e}")
+                            with self.polling_lock:
+                                self.polling_text = ""
+                except Exception as e:
+                    logger.error(f"Polling worker error: {e}")
+                
+                # Small delay between polls
+                time.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Polling worker crashed: {e}")
+        finally:
+            logger.info("🎤 Polling worker finished")
     
     def get_performance_stats(self) -> dict:
         return {

@@ -1,4 +1,4 @@
-# main.py - FULL-DUPLEX FIXED VERSION
+# main.py - FULL-
 import warnings
 import logging
 
@@ -65,11 +65,30 @@ async def handle_conversation_turn(stt_handler, llm_handler, tts_handler,
     try:
         turn_start = time.time()
         
-        # Step 1: Get user input (BLOCKING - only when not playing TTS)
+        # Step 1: Get user input using background polling
         logger.info("🎤 Listening for speech...")
         print("\n🎤 Speak now...")
         
-        user_text = await stt_handler.get_transcription()
+        user_text = ""
+        max_wait_time = 15.0  # Maximum time to wait for speech
+        start_wait = time.time()
+        
+        # Poll for user speech using background polling
+        while time.time() - start_wait < max_wait_time:
+            current_time = time.time()
+            
+            # Get result from background polling
+            polling_text = stt_handler.get_barge_in_text()
+            if polling_text and len(polling_text.strip()) > 2:
+                user_text = polling_text.strip()
+                logger.info(f"🎤 Polling detected speech: '{user_text[:30]}...'")
+                break
+            
+            # Debug logging
+            if polling_text:
+                logger.debug(f"🎤 Polling result: '{polling_text.strip()[:20]}...'")
+            
+            await asyncio.sleep(0.1)  # Check every 100ms
         
         if not user_text:
             logger.warning("⚠️ No speech detected")
@@ -127,8 +146,8 @@ async def handle_conversation_turn(stt_handler, llm_handler, tts_handler,
         if tts_handler.is_barge_in_detected():
             print("🎤 You interrupted!")
             
-            # CRITICAL: Get the interrupting text from real-time STT
-            interruption_text = stt_handler.get_realtime_text()
+            # CRITICAL: Get the interrupting text from polling STT
+            interruption_text = stt_handler.get_barge_in_text()
             
             if interruption_text and len(interruption_text) > 2:
                 print(f"📝 You said: {interruption_text}")
@@ -137,7 +156,7 @@ async def handle_conversation_turn(stt_handler, llm_handler, tts_handler,
                 await asyncio.sleep(0.3)
                 
                 # Get full transcription if available
-                final_text = stt_handler.get_realtime_text()
+                final_text = stt_handler.get_barge_in_text()
                 if final_text and len(final_text) > len(interruption_text):
                     interruption_text = final_text
                 
@@ -193,6 +212,10 @@ async def main():
         await stt_handler.start_listening()
         logger.info("✅ STT: Continuous listening active")
         
+        # Start background polling for barge-in detection
+        stt_handler.start_polling_for_barge_in()
+        logger.info("✅ STT: Background polling active")
+        
         # Initialize LLM
         llm_handler = LLMHandler()
         logger.info("✅ LLM: Ready")
@@ -211,13 +234,19 @@ async def main():
         
         print("✅ System ready! Full-duplex mode active.")
         
-        # Welcome message
+        # Welcome message - use non-blocking approach to ensure STT stays active
         welcome = "Hello! I'm Alex from Shamla Tech. How can I help you today?"
         print(f"\n🤖 Agent: {welcome}")
         conversation_manager.add_turn("Agent", welcome)
         
+        # Speak welcome with barge-in disabled for initial greeting
+        # Then start polling after welcome completes
         tts_handler.speak(welcome, enable_barge_in=False)
         tts_handler.wait_for_completion(timeout=15.0)
+        
+        # Start background polling for barge-in detection after welcome
+        stt_handler.start_polling_for_barge_in()
+        logger.info("✅ STT: Background polling started for conversation")
         
         print("\n💡 Tips:")
         print("- Speak naturally - I'm always listening")
@@ -275,6 +304,7 @@ async def main():
         
         try:
             if stt_handler:
+                stt_handler.stop_polling_for_barge_in()
                 await stt_handler.stop_listening()
         except Exception as e:
             logger.error(f"STT cleanup error: {e}")

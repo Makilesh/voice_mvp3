@@ -1,15 +1,27 @@
 # tts_handler.py - FULL-DUPLEX FIXED VERSION
+# CHANGES: Fixed barge-in detection to immediately stop TTS playback when user interrupts
+# - Added immediate stream.stop() call when barge-in confirmed
+# - Enhanced playback thread monitoring for stop events
+# - Improved wait_for_completion to properly handle barge-in state
+# - Added detailed logging for barge-in events
+# All changes focused on: Interrupt → Stop TTS → Resume logic only
+
+
+# old
+
 import os
 import logging
 import time
 import threading
 import warnings
+import asyncio
 from RealtimeTTS import SystemEngine, TextToAudioStream
 
 import os
 import logging
 import time
 import threading
+import asyncio
 from RealtimeTTS import SystemEngine, TextToAudioStream
 
 # Configure logging
@@ -161,25 +173,50 @@ class TTSHandler:
                     continue
                 
                 try:
-                    # Get real-time transcription
-                    realtime_text = self.main_stt.get_realtime_text()
+                    # Use the new polling-based barge-in detection
+                    barge_in_text = self.main_stt.get_barge_in_text()
                     
-                    # Detect new speech (not just continuation)
-                    if realtime_text and len(realtime_text) > self.barge_in_sensitivity:
-                        if realtime_text != self.last_seen_realtime_text:
+                    # Debug logging
+                    if barge_in_text and len(barge_in_text.strip()) > 0:
+                        logger.debug(f"🎤 Barge-in text: '{barge_in_text.strip()[:30]}...'")
+                    
+                    # Detect any speech above sensitivity threshold
+                    if barge_in_text and len(barge_in_text.strip()) >= self.barge_in_sensitivity:
+                        # Check if we have meaningful new speech (not just whitespace/empty)
+                        current_stripped = barge_in_text.strip()
+                        last_stripped = self.last_seen_realtime_text.strip()
+                        
+                        # If we have new speech (different from last or longer)
+                        if current_stripped != last_stripped or len(current_stripped) > len(last_stripped):
                             consecutive_detections += 1
+                            
+                            # Log detection for debugging
+                            logger.debug(f"🎤 Speech detected: '{current_stripped[:20]}...' (consecutive: {consecutive_detections}/{min_consecutive})")
                             
                             # Confirm with consecutive detections
                             if consecutive_detections >= min_consecutive:
-                                logger.info(f"🛑 Barge-in detected: {realtime_text[:30]}...")
+                                elapsed_ms = (time.time() - playback_start) * 1000
+                                logger.info(f"🛑 BARGE-IN CONFIRMED at {elapsed_ms:.0f}ms: '{current_stripped[:30]}...'")
+                                
+                                # STOP TTS IMMEDIATELY
                                 with self.state_lock:
                                     self.barge_in_detected = True
-                                self.stop_event.set()
+                                    self.stop_event.set()
+                                
+                                # CRITICAL: Force stop TTS playback
+                                if self.stream:
+                                    try:
+                                        self.stream.stop()
+                                        logger.info("🛑 TTS playback stopped immediately")
+                                    except Exception as e:
+                                        logger.error(f"❌ Failed to stop TTS: {e}")
+                                
                                 break
                         else:
+                            # Reset if no meaningful new speech
                             consecutive_detections = max(0, consecutive_detections - 1)
                     
-                    self.last_seen_realtime_text = realtime_text
+                    self.last_seen_realtime_text = barge_in_text
                 except Exception as e:
                     logger.warning(f"⚠️ Monitor check error: {e}")
                 
@@ -197,25 +234,34 @@ class TTSHandler:
             try:
                 with self.state_lock:
                     self.is_playing = True
-                    # self.barge_in_detected = False
+                    self.barge_in_detected = False
                 self.stop_event.clear()
+                
+                # CRITICAL: Start STT polling for barge-in detection
+                if self.main_stt:
+                    self.main_stt.start_polling_for_barge_in()
+                
+                # Brief delay to ensure polling is active
+                time.sleep(0.1)  # Give polling time to start
                 
                 # CRITICAL: Start monitor BEFORE audio starts
                 monitor_thread = threading.Thread(target=self._monitor_barge_in, daemon=True)
                 monitor_thread.start()
                 
                 # Brief delay to ensure monitor is active
-                time.sleep(0.02)
+                time.sleep(0.05)
                 
                 # Play audio (non-blocking thread)
                 if self.stream:
                     self.stream.feed(text)
                     self.stream.play_async()
-                    # try:
-                    #     self.stream.play()
-                    # except Exception as e:
-                    #         if not self.stop_event.is_set():
-                    #                 logger.error(f"❌ Playback error: {e}")
+                    
+                    # CRITICAL: Monitor for stop event in playback thread
+                    while not self.stop_event.is_set():
+                        if self.stream and self.stream.is_playing:
+                            time.sleep(0.01)
+                        else:
+                            break
                         
             except Exception as e:
                 logger.error(f"❌ Playback thread error: {e}")
@@ -223,6 +269,10 @@ class TTSHandler:
                 with self.state_lock:
                     self.is_playing = False
                 self.stop_event.clear()
+                
+                # CRITICAL: Stop STT polling when playback ends
+                if self.main_stt:
+                    self.main_stt.stop_polling_for_barge_in()
         
         # Start playback in daemon thread
         self.playback_thread = threading.Thread(target=play_audio, daemon=True)
@@ -266,18 +316,14 @@ class TTSHandler:
             
             while True:
                 with self.state_lock:
-                    # if not self.is_playing:
-                    #     was_interrupted = self.barge_in_detected
-                    #     if was_interrupted:
-                    #         logger.info("✅ Playback interrupted by user")
-                    #     return not was_interrupted
-                    
-                    # if self.barge_in_detected:
-                    #     return False
-                    
                     if not self.is_playing:
-                        return True
+                        was_interrupted = self.barge_in_detected
+                        if was_interrupted:
+                            logger.info("✅ Playback interrupted by user")
+                        return not was_interrupted
+                    
                     if self.barge_in_detected:
+                        logger.info("✅ Playback stopped due to barge-in")
                         return False
                 
                 if time.time() - start_time > timeout:
@@ -304,12 +350,15 @@ class TTSHandler:
                 self.is_playing = False
             self.stop_event.set()
             
+            # Stop playback if active
             if hasattr(self, 'stream') and self.stream:
                 try:
-                    self.stream.stop()
-                except Exception:
-                    pass
-                self.stream = None
+                    if hasattr(self.stream, 'is_playing') and self.stream.is_playing:
+                        self.stream.stop()
+                except Exception as e:
+                    logger.warning(f"⚠️ Error stopping stream: {e}")
+                finally:
+                    self.stream = None
             
             if hasattr(self, 'engine'):
                 self.engine = None
