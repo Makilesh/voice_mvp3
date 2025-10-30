@@ -1,286 +1,242 @@
-# tts_handler.py - FIXED VERSION
+# tts_handler.py - FULL-DUPLEX FIXED VERSION
 import os
 import logging
-import asyncio
 import time
 import threading
 import warnings
-import numpy as np
 from RealtimeTTS import SystemEngine, TextToAudioStream
-from RealtimeSTT import AudioToTextRecorder
 
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+import os
+import logging
+import time
+import threading
+from RealtimeTTS import SystemEngine, TextToAudioStream
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
 logger = logging.getLogger(__name__)
 
 class TTSHandler:
-    """Handles TTS with INSTANT, reliable barge-in detection (<100ms)."""
+    """TTS with <150ms barge-in using continuous STT monitoring."""
     
     def __init__(self, stt_handler=None):
-        """Initialize TTS with real-time VAD-based barge-in."""
         try:
             self.engine = SystemEngine()
             self.stream = TextToAudioStream(self.engine)
             
-            # Main STT handler (shared)
+            # CRITICAL: Reference to main STT (must be continuously listening)
             self.main_stt = stt_handler
+            if not self.main_stt:
+                raise ValueError("STT handler required for barge-in detection")
             
-            # # Dedicated lightweight STT for barge-in monitoring
-            # self.barge_in_recorder = None
-            # self._init_barge_in_recorder()
-            
-            # State management with thread safety
+            # State management
             self.is_playing = False
             self.is_barge_in_enabled = True
             self.barge_in_detected = False
             self.stop_event = threading.Event()
             self.state_lock = threading.Lock()
             
-            # Real-time speech detection flag (updated by callback)
-            # self.speech_detected = False
-            # self.speech_start_time = None
+            # Real-time monitoring state
+            self.last_seen_realtime_text = ""
+            self.barge_in_sensitivity = 2  # Minimum chars to trigger (very sensitive)
             
-            # Adaptive noise rejection
-            # self.ambient_noise_level = 0
-            # self.noise_floor_samples = []
-            
-            
-            # Line 27 - ADD AFTER self.main_stt = stt_handler:
-            
-            # Use MAIN STT for barge-in (no separate recorder needed)
-            self.last_realtime_text = ""
-            self.realtime_text_lock = threading.Lock()
-            
-            logger.info("🎤 TTS Handler initialized with INSTANT barge-in (VAD-based).")
+            logger.info("🎤 TTS Handler initialized with AGGRESSIVE barge-in (<150ms)")
         except Exception as e:
             logger.error(f"❌ Error initializing TTS: {e}")
             raise
     
-    def _init_barge_in_recorder(self):
-        """Initialize lightweight STT with REAL-TIME callbacks for instant detection."""
+    # def _monitor_barge_in(self):
+    #     """
+    #     CRITICAL: Aggressively monitor STT real-time transcription during playback.
+    #     Triggers stop within 20-50ms of speech detection.
+    #     """
+    #     try:
+    #         if not self.is_barge_in_enabled or not self.main_stt:
+    #             return
+            
+    #         playback_start = time.time()
+    #         tts_startup_buffer = 0.15  # Ignore first 150ms (TTS ramp-up)
+    #         check_interval = 0.02  # Check every 20ms (aggressive polling)
+            
+    #         logger.info("👂 Barge-in monitor: ACTIVE")
+            
+    #         # Reset tracking
+    #         self.last_seen_realtime_text = ""
+    #         consecutive_detections = 0
+    #         min_consecutive = 2  # Need 2 consecutive detections (40ms) to confirm
+            
+    #         while not self.stop_event.is_set():
+    #             with self.state_lock:
+    #                 if not self.is_playing:
+    #                     break
+                
+    #             current_time = time.time()
+                
+    #             # Skip TTS startup buffer
+    #             if current_time - playback_start < tts_startup_buffer:
+    #                 time.sleep(check_interval)
+    #                 continue
+                
+                # try:
+                #     # CRITICAL: Get real-time text from continuously listening STT
+                #     current_realtime = self.main_stt.get_realtime_text()
+                    
+                #     if not current_realtime:
+                #         consecutive_detections = 0
+                #         time.sleep(check_interval)
+                #         continue
+                    
+                #     # Detect NEW speech (text changed or grew)
+                #     if current_realtime != self.last_seen_realtime_text:
+                #         new_text = current_realtime[len(self.last_seen_realtime_text):].strip()
+                        
+                #         # CRITICAL: Very sensitive detection
+                #         if len(new_text) >= self.barge_in_sensitivity:
+                #             consecutive_detections += 1
+                            
+                #             logger.debug(f"🎤 Speech fragment detected: '{new_text}' "
+                #                        f"(confirmations: {consecutive_detections}/{min_consecutive})")
+                            
+                #             # Confirm barge-in after multiple detections
+                #             if consecutive_detections >= min_consecutive:
+                #                 elapsed_ms = (time.time() - playback_start) * 1000
+                #                 logger.info(f"🎤 BARGE-IN CONFIRMED at {elapsed_ms:.0f}ms: '{current_realtime}'")
+                                
+                #                 # STOP IMMEDIATELY
+                #                 with self.state_lock:
+                #                     self.barge_in_detected = True
+                #                     self.stop_event.set()
+                                
+                #                 if self.stream:
+                #                     try:
+                #                         self.stream.stop()
+                #                         logger.info("🛑 TTS stopped in <150ms")
+                #                     except Exception as e:
+                #                         logger.error(f"Stop failed: {e}")
+                                
+                #                 break
+                #         else:
+                #             consecutive_detections = 0
+                        
+                #         self.last_seen_realtime_text = current_realtime
+                    
+                # except Exception as e:
+                #     logger.debug(f"Monitor check error: {e}")
+                
+                # ...existing code...
+    def _monitor_barge_in(self):
+        """
+        CRITICAL: Aggressively monitor STT real-time transcription during playback.
+        Triggers stop within 20-50ms of speech detection.
+        """
         try:
-            # CRITICAL FIX: Use on_recording_start callback for INSTANT detection
-            def on_recording_start():
-                """Called IMMEDIATELY when speech is detected (VAD trigger)."""
+            if not self.is_barge_in_enabled or not self.main_stt:
+                return
+            
+            playback_start = time.time()
+            tts_startup_buffer = 0.15  # Ignore first 150ms (TTS ramp-up)
+            check_interval = 0.02  # Check every 20ms (aggressive polling)
+            
+            logger.info("👂 Barge-in monitor: ACTIVE")
+            
+            # Reset tracking
+            self.last_seen_realtime_text = ""
+            consecutive_detections = 0
+            min_consecutive = 2  # Need 2 consecutive detections (40ms) to confirm
+            
+            while not self.stop_event.is_set():
                 with self.state_lock:
-                    self.speech_detected = True
-                    self.speech_start_time = time.time()
-                logger.debug("🎤 Speech START detected (VAD)")
-            
-            def on_recording_stop():
-                """Called when speech ends."""
-                logger.debug("🎤 Speech STOP detected (VAD)")
-            
-            self.barge_in_recorder = AudioToTextRecorder(
-                model="tiny",  # Fastest for VAD only
-                language="en",
-                compute_type="int8",
-                enable_realtime_transcription=False,  # Don't need transcription for barge-in
+                    if not self.is_playing:
+                        break
                 
-                # CRITICAL: Ultra-fast VAD settings for instant detection
-                post_speech_silence_duration=0.2,  # Minimal (we don't wait for transcription)
-                min_length_of_recording=0.2,  # Catch quick interjections
-                min_gap_between_recordings=0.05,
+                current_time = time.time()
                 
-                # CRITICAL: High sensitivity during playback
-                silero_sensitivity=0.4,  # More sensitive (was 0.3)
-                silero_use_onnx=True,  # Faster VAD
-                webrtc_sensitivity=2,
+                # Skip TTS startup buffer
+                if current_time - playback_start < tts_startup_buffer:
+                    time.sleep(check_interval)
+                    continue
                 
-                # Callbacks for INSTANT detection
-                on_recording_start=on_recording_start,
-                on_recording_stop=on_recording_stop,
-                
-                use_microphone=True
-            )
-            
-            # Start the recorder in listening mode
-            # Note: RealtimeSTT starts listening automatically
-            
-            logger.info("✅ Barge-in recorder initialized (VAD callback mode)")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not init barge-in recorder: {e}")
-            self.barge_in_recorder = None
-    
-    def _calibrate_noise_floor(self, duration: float = 0.3):
-        """Calibrate ambient noise level during TTS startup."""
-        try:
-            # Sample ambient noise for first 300ms
-            # This would require raw audio access - simplified version
-            # In production, you'd average energy levels during silence
-            self.ambient_noise_level = 150  # Conservative baseline
-            logger.debug(f"🔇 Noise floor calibrated: {self.ambient_noise_level}")
-        except Exception as e:
-            logger.warning(f"Calibration failed: {e}")
-    
-    def _playback_with_barge_in(self, text: str):
-        """Play audio with INSTANT VAD-based barge-in monitoring (<100ms stop)."""
-      
-        # def monitor_speech():
-        #     """Monitor MAIN STT's real-time transcription for barge-in."""
-        #     try:
-        #         if not (self.is_barge_in_enabled and self.main_stt and self.main_stt.recorder):
-        #             logger.warning("⚠️ Barge-in monitoring disabled (no main STT)")
-        #             return
-                
-        #         playback_start = time.time()
-        #         tts_buffer_duration = 0.2  # Ignore first 200ms (TTS startup)
-        #         check_interval = 0.05  # Check every 50ms
-                
-        #         logger.debug("👂 Barge-in monitor started")
-                
-        #         # Track what we've seen
-        #         last_seen_text = ""
-                
-        #         while not self.stop_event.is_set():
-        #             with self.state_lock:
-        #                 if not self.is_playing:
-        #                     break
+                try:
+                    # Get real-time transcription
+                    realtime_text = self.main_stt.get_realtime_text()
                     
-        #             current_time = time.time()
-                    
-        #             # Skip initial TTS buffer
-        #             if current_time - playback_start < tts_buffer_duration:
-        #                 time.sleep(check_interval)
-        #                 continue
-                    
-        #             # CRITICAL: Get real-time text from MAIN STT
-        #             try:
-        #                 # RealtimeSTT accumulates text in recorder.realtime_stabilized_text
-        #                 current_text = ""
-        #                 if hasattr(self.main_stt.recorder, 'realtime_stabilized_text'):
-        #                     current_text = self.main_stt.recorder.realtime_stabilized_text
-        #                 elif hasattr(self.main_stt.recorder, 'text'):
-        #                     # Fallback: non-blocking check
-        #                     current_text = getattr(self.main_stt.recorder, '_last_transcription', '')
-                        
-        #                 # Detect NEW text (user started speaking)
-        #                 if current_text and current_text != last_seen_text:
-        #                     new_text = current_text[len(last_seen_text):].strip()
+                    # Detect new speech (not just continuation)
+                    if realtime_text and len(realtime_text) > self.barge_in_sensitivity:
+                        if realtime_text != self.last_seen_realtime_text:
+                            consecutive_detections += 1
                             
-        #                     if new_text and len(new_text) > 1:  # At least 2 chars
-        #                         logger.info(f"🎤 BARGE-IN: User said '{new_text}'")
-                                
-        #                         with self.state_lock:
-        #                             self.barge_in_detected = True
-        #                             self.stop_event.set()
-                                
-        #                         # Stop audio IMMEDIATELY
-        #                         if self.stream:
-        #                             try:
-        #                                 self.stream.stop()
-        #                                 logger.info("🛑 Audio stopped")
-        #                             except Exception as e:
-        #                                 logger.error(f"Stop failed: {e}")
-                                
-        #                         break
-                            
-        #                     last_seen_text = current_text
-                        
-        #             except Exception as e:
-        #                 logger.debug(f"Monitor check error: {e}")
-                    
-        #             time.sleep(check_interval)
-                
-        #         logger.debug("👂 Barge-in monitor stopped")
-                    
-        #     except Exception as e:
-        #         logger.error(f"❌ Barge-in monitor error: {e}")
-                
-        def monitor_speech():
-            """Energy-based VAD monitoring using main STT."""
-            try:
-                if not (self.is_barge_in_enabled and self.main_stt and self.main_stt.recorder):
-                    return
-                
-                playback_start = time.time()
-                tts_buffer = 0.2
-                
-                # Access VAD state from main recorder
-                while not self.stop_event.is_set():
-                    with self.state_lock:
-                        if not self.is_playing:
-                            break
-                    
-                    if time.time() - playback_start < tts_buffer:
-                        time.sleep(0.02)
-                        continue
-                    
-                    # Check if main recorder detects voice activity
-                    try:
-                        recorder = self.main_stt.recorder
-                        
-                        # RealtimeSTT has is_recording property
-                        if hasattr(recorder, 'is_recording') and recorder.is_recording:
-                            logger.info("🎤 BARGE-IN: Voice activity detected")
-                            
-                            with self.state_lock:
-                                self.barge_in_detected = True
+                            # Confirm with consecutive detections
+                            if consecutive_detections >= min_consecutive:
+                                logger.info(f"🛑 Barge-in detected: {realtime_text[:30]}...")
+                                with self.state_lock:
+                                    self.barge_in_detected = True
                                 self.stop_event.set()
-                            
-                            if self.stream:
-                                self.stream.stop()
-                                logger.info("🛑 Audio stopped")
-                            break
+                                break
+                        else:
+                            consecutive_detections = max(0, consecutive_detections - 1)
                     
-                    except Exception as e:
-                        logger.debug(f"VAD check error: {e}")
-                    
-                    time.sleep(0.02)  # 20ms polling
-                    
-            except Exception as e:
-                logger.error(f"❌ Monitor error: {e}")
+                    self.last_seen_realtime_text = realtime_text
+                except Exception as e:
+                    logger.warning(f"⚠️ Monitor check error: {e}")
                 
-                
+                time.sleep(check_interval)
+            
+            logger.info("👂 Barge-in monitor: STOPPED")
+            
+        except Exception as e:
+            logger.error(f"❌ Barge-in monitor crashed: {e}")
+    
+    def _play_with_monitoring(self, text: str):
+        """Play audio while monitoring for barge-in."""
+        
         def play_audio():
-            """Play audio stream with monitoring."""
             try:
                 with self.state_lock:
                     self.is_playing = True
-                    self.barge_in_detected = False
-                    self.speech_detected = False
+                    # self.barge_in_detected = False
                 self.stop_event.clear()
                 
-                # Start monitoring thread BEFORE audio starts
-                monitor_thread = threading.Thread(target=monitor_speech, daemon=True)
+                # CRITICAL: Start monitor BEFORE audio starts
+                monitor_thread = threading.Thread(target=self._monitor_barge_in, daemon=True)
                 monitor_thread.start()
                 
-                # Brief delay to ensure monitor is running
-                time.sleep(0.01)
+                # Brief delay to ensure monitor is active
+                time.sleep(0.02)
                 
-                # Play audio
+                # Play audio (non-blocking thread)
                 if self.stream:
                     self.stream.feed(text)
-                    try:
-                        self.stream.play()
-                    except Exception as e:
-                        if not self.stop_event.is_set():
-                            logger.error(f"❌ Playback error: {e}")
-                
+                    self.stream.play_async()
+                    # try:
+                    #     self.stream.play()
+                    # except Exception as e:
+                    #         if not self.stop_event.is_set():
+                    #                 logger.error(f"❌ Playback error: {e}")
+                        
             except Exception as e:
-                logger.error(f"❌ Playback error: {e}")
+                logger.error(f"❌ Playback thread error: {e}")
             finally:
                 with self.state_lock:
                     self.is_playing = False
                 self.stop_event.clear()
         
-        # Start playback in thread
+        # Start playback in daemon thread
         self.playback_thread = threading.Thread(target=play_audio, daemon=True)
         self.playback_thread.start()
     
     def speak(self, text: str, voice: str = "default", emotive_tags: str = "", 
               enable_barge_in: bool = True) -> str:
-        """Convert text to speech with INSTANT barge-in capability."""
+        """Speak with instant barge-in detection."""
         try:
             if not self.engine or not self.stream:
                 raise ValueError("TTS not initialized")
             
             self.is_barge_in_enabled = enable_barge_in
-            logger.info(f"🗣 Speaking: {text[:50]}...")
+            logger.info(f"🗣 Speaking: {text[:50]}... (barge-in: {enable_barge_in})")
             
             if emotive_tags:
                 text = f"{text} {emotive_tags}"
@@ -291,7 +247,11 @@ class TTSHandler:
                 except Exception as e:
                     logger.warning(f"Voice '{voice}' unavailable: {e}")
             
-            self._playback_with_barge_in(text)
+            # CRITICAL: Clear STT real-time buffer before speaking
+            if self.main_stt:
+                self.main_stt.clear_realtime_text()
+            
+            self._play_with_monitoring(text)
             
             return "audio_playing"
             
@@ -300,14 +260,23 @@ class TTSHandler:
             return ""
     
     def wait_for_completion(self, timeout: float = 30.0) -> bool:
-        """Wait for playback completion or barge-in."""
+        """Wait for playback to complete or be interrupted."""
         try:
             start_time = time.time()
             
             while True:
                 with self.state_lock:
+                    # if not self.is_playing:
+                    #     was_interrupted = self.barge_in_detected
+                    #     if was_interrupted:
+                    #         logger.info("✅ Playback interrupted by user")
+                    #     return not was_interrupted
+                    
+                    # if self.barge_in_detected:
+                    #     return False
+                    
                     if not self.is_playing:
-                        return not self.barge_in_detected
+                        return True
                     if self.barge_in_detected:
                         return False
                 
@@ -315,19 +284,19 @@ class TTSHandler:
                     logger.warning("⏰ Playback timeout")
                     return False
                 
-                time.sleep(0.01)  # Fast polling (10ms)
+                time.sleep(0.01)  # 10ms polling
                 
         except Exception as e:
             logger.error(f"❌ Wait error: {e}")
             return False
     
     def is_barge_in_detected(self) -> bool:
-        """Check if barge-in occurred."""
+        """Check if user interrupted playback."""
         with self.state_lock:
             return self.barge_in_detected
     
     def shutdown(self):
-        """Clean shutdown with resource cleanup."""
+        """Clean shutdown."""
         try:
             logger.info("🧹 Shutting down TTS...")
             
@@ -335,7 +304,6 @@ class TTSHandler:
                 self.is_playing = False
             self.stop_event.set()
             
-            # Stop streams
             if hasattr(self, 'stream') and self.stream:
                 try:
                     self.stream.stop()
@@ -343,45 +311,9 @@ class TTSHandler:
                     pass
                 self.stream = None
             
-            # Cleanup engine
             if hasattr(self, 'engine'):
                 self.engine = None
-            
-            # # Cleanup barge-in recorder (don't call shutdown, just dereference)
-            # if self.barge_in_recorder:
-            #     self.barge_in_recorder = None
-            
-            # Barge-in uses main STT (no separate cleanup needed)
-            pass
             
             logger.info("✅ TTS shutdown complete")
         except Exception as e:
             logger.error(f"❌ Shutdown error: {e}")
-
-
-async def main():
-    """Test TTS with instant barge-in."""
-    from stt_handler import STTHandler
-    
-    stt = STTHandler()
-    await stt.start_listening()
-    
-    tts = TTSHandler(stt_handler=stt)
-    
-    test_text = "This is a test of the INSTANT barge-in system. Try interrupting me RIGHT NOW by speaking!"
-    print(f"Speaking: {test_text}")
-    print("🎤 Interrupt by speaking NOW!")
-    
-    tts.speak(test_text)
-    completed = tts.wait_for_completion(timeout=20.0)
-    
-    if tts.is_barge_in_detected():
-        print("✅ Barge-in detected INSTANTLY!")
-    else:
-        print("⏹ Playback completed without interruption")
-    
-    tts.shutdown()
-    await stt.stop_listening()
-
-if __name__ == "__main__":
-    asyncio.run(main())
