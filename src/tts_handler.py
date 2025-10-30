@@ -295,6 +295,18 @@ class TTSHandler:
         with self.state_lock:
             return self.barge_in_detected
     
+    def stop_playback(self):
+        """Immediately stop TTS playback."""
+        try:
+            if self.stream:
+                self.stream.stop()
+                logger.info("🛑 TTS aborted on voice detect")
+            with self.state_lock:
+                self.barge_in_detected = True
+            self.stop_event.set()
+        except Exception as e:
+            logger.error(f"Stop playback error: {e}")
+    
     def shutdown(self):
         """Clean shutdown."""
         try:

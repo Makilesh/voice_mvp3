@@ -201,6 +201,9 @@ async def main():
         tts_handler = TTSHandler(stt_handler=stt_handler)
         logger.info("✅ TTS: Barge-in monitoring active")
         
+        # FIX: Link STT voice detection to TTS stop for partial barge-in (e.g., "could you..." from logs)
+        stt_handler.tts_stop_callback = tts_handler.stop_playback
+        
         # Initialize conversation
         conversation_manager = ConversationManager(max_history=12)
         conversation_manager.add_turn(

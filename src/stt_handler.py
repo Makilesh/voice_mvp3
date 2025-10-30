@@ -49,6 +49,9 @@ class STTHandler:
         self.realtime_text = ""
         self.realtime_lock = threading.Lock()
         
+        # FIX: Link STT voice detection to TTS stop for partial barge-in (e.g., "could you..." from logs)
+        self.tts_stop_callback = None
+        
         # CRITICAL: Completed transcription queue (non-blocking)
         self.completed_transcriptions = asyncio.Queue()
         self.last_completed_text = ""
@@ -97,6 +100,10 @@ class STTHandler:
                 
                 def on_realtime_update(text: str):
                     handler_self._on_realtime_update(text)
+                    
+                    # FIX: Trigger TTS stop on voice detection
+                    if handler_self.tts_stop_callback:
+                        handler_self.tts_stop_callback()
                 
                 def on_transcription_complete(text: str):
                     handler_self._on_transcription_complete(text)
