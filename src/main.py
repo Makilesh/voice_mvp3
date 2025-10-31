@@ -204,6 +204,9 @@ async def main():
         # FIX: Link STT voice detection to TTS stop for partial barge-in (e.g., "could you..." from logs)
         stt_handler.tts_stop_callback = tts_handler.stop_playback
         
+        # FIX-FINAL: Connect TTS active state for conditional VAD trigger
+        tts_handler.set_tts_active = lambda active: setattr(stt_handler, 'tts_active', active)
+        
         # Initialize conversation
         conversation_manager = ConversationManager(max_history=12)
         conversation_manager.add_turn(
@@ -279,6 +282,9 @@ async def main():
         try:
             if stt_handler:
                 await stt_handler.stop_listening()
+                # Windows: Main guard if __name__=='__main__'; shutdown: recorder.process.join(timeout=1) (fix [WinError 6])
+                if hasattr(stt_handler, 'recorder') and stt_handler.recorder and hasattr(stt_handler.recorder, 'process'):
+                    stt_handler.recorder.process.join(timeout=1)
         except Exception as e:
             logger.error(f"STT cleanup error: {e}")
         

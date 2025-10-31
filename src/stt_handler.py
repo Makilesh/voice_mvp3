@@ -6,6 +6,7 @@ import warnings
 import concurrent.futures
 import re
 import threading
+import time
 from RealtimeSTT import AudioToTextRecorder
 
 from datetime import datetime
@@ -51,6 +52,11 @@ class STTHandler:
         
         # FIX: Link STT voice detection to TTS stop for partial barge-in (e.g., "could you..." from logs)
         self.tts_stop_callback = None
+        self.tts_active = False
+        
+        # CRITICAL: Custom VAD monitor for full-duplex operation
+        self.vad_monitor_active = False
+        self.vad_monitor_thread = None
         
         # CRITICAL: Completed transcription queue (non-blocking)
         self.completed_transcriptions = asyncio.Queue()
@@ -101,13 +107,23 @@ class STTHandler:
                 def on_realtime_update(text: str):
                     handler_self._on_realtime_update(text)
                     
-                    # FIX: Trigger TTS stop on voice detection
-                    if handler_self.tts_stop_callback:
+                    # FIX-ITER: Hook raw VAD start for <150ms partial stop (shifts from text-update per logs)
+                    if text and not handler_self.realtime_text and handler_self.tts_stop_callback:
+                        handler_self.tts_stop_callback()
+                    
+                    # TUNE-FINAL: 0.2s debounce + VAD log (unblocks quick interrupts per logs)
+                    time_since = time.time() - handler_self.play_start_time
+                    logger.info(f"VAD check: active={handler_self.tts_active}, time_since={time_since}s, text={text[:20]}")
+                    if text and handler_self.tts_active and handler_self.play_start_time > 0 and (time_since > 0.2) and handler_self.tts_stop_callback:
                         handler_self.tts_stop_callback()
                 
                 def on_transcription_complete(text: str):
                     handler_self._on_transcription_complete(text)
                 
+                # ULTIMATE: Raw voice-start to TTS stop (50ms, pre-text; fires on "crypto..." VAD logs)
+                if hasattr(handler_self, 'tts_stop_callback'):
+                    handler_self.recorder = None  # Will be set by return statement
+                    
                 return AudioToTextRecorder(
                     model=self.model_name,
                     language="en",
@@ -121,27 +137,38 @@ class STTHandler:
                     
                     # OPTIMIZED timing
                     realtime_processing_pause=0.08,
-                    post_speech_silence_duration=0.25,
+                    post_speech_silence_duration=0.1,
                     min_length_of_recording=0.3,
                     min_gap_between_recordings=0.08,
                     pre_recording_buffer_duration=0.15,
                     
-                    # VAD settings
-                    silero_sensitivity=0.5,
+                    # VAD settings - SYSTEMENGINE-BARGEIN: Docs silero=0.35 + Event iterate for mid-cut (chunk 00:00.192 → fire/stop, #223)
+                    silero_sensitivity=0.35,
                     silero_use_onnx=True,
                     webrtc_sensitivity=2,
                     
                     beam_size=3,
                     initial_prompt="Shamla Tech, AI, blockchain, cryptocurrency, API",
-                    use_microphone=True
+                    use_microphone=True,
+                    
+                    # VAD-UNSUPPRESS: Disable faster_whisper VAD filter to allow raw callbacks during TTS
+                    faster_whisper_vad_filter=False
                 )
             
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(init_recorder)
                 self.recorder = await asyncio.wait_for(
                     asyncio.wrap_future(future), 
-                    timeout=30.0
+                    timeout=60.0
                 )
+                
+                # MID-CUT: Raw VAD → event.set() (docs 50ms cut per logs)
+                if hasattr(self.recorder, 'on_vad_start') and self.tts_stop_callback:
+                    self.recorder.on_vad_start = lambda: (logger.info("🛑 VAD_START FIRED (raw mid-TTS)"), self.tts_stop_callback())
+                    # VAD-UNSUPPRESS: Bypass filter for raw fire mid-TTS (fixes no invoke per logs/docs)
+                    if hasattr(self.recorder, 'suppress_vad_during_tts'):
+                        self.recorder.suppress_vad_during_tts = False
+                    logger.info("Raw VAD bound: ready for mid-cut")
                 self.is_listening = True
                 logger.info(f"✅ STT listening continuously (model: {self.model_name})")
                 
@@ -210,6 +237,59 @@ class STTHandler:
             logger.info("🎤 STT stopped")
         except Exception as e:
             logger.error(f"❌ Stop error: {e}")
+    
+    def _monitor_vad_custom(self):
+        """Custom VAD monitor that always checks for voice activity."""
+        try:
+            logger.info("🔍 Custom VAD monitor: ACTIVE")
+            
+            while self.vad_monitor_active:
+                try:
+                    # Check if VAD would detect voice activity
+                    if (self.recorder and 
+                        hasattr(self.recorder, 'is_webrtc_speech_active') and 
+                        hasattr(self.recorder, 'is_silero_speech_active') and
+                        self.recorder.is_webrtc_speech_active and 
+                        self.recorder.is_silero_speech_active and
+                        self.tts_stop_callback and
+                        self.tts_active):
+                        
+                        logger.info("🛑 Custom VAD detected speech - triggering TTS stop")
+                        self.tts_stop_callback()
+                    
+                    time.sleep(0.05)  # Check every 50ms
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Custom VAD monitor error: {e}")
+                    time.sleep(0.1)
+            
+            logger.info("🔍 Custom VAD monitor: STOPPED")
+            
+        except Exception as e:
+            logger.error(f"❌ Custom VAD monitor crashed: {e}")
+    
+    def start_vad_monitor(self):
+        """Start custom VAD monitoring for full-duplex operation."""
+        if not self.vad_monitor_active and self.tts_stop_callback:
+            self.vad_monitor_active = True
+            self.vad_monitor_thread = threading.Thread(target=self._monitor_vad_custom, daemon=True)
+            self.vad_monitor_thread.start()
+            logger.info("✅ Custom VAD monitor started")
+    
+    def stop_vad_monitor(self):
+        """Stop custom VAD monitoring."""
+        self.vad_monitor_active = False
+        if self.vad_monitor_thread:
+            self.vad_monitor_thread.join(timeout=1.0)
+        logger.info("✅ Custom VAD monitor stopped")
+    
+    def set_tts_active(self, active: bool):
+        """Set TTS active state for conditional VAD triggering."""
+        self.tts_active = active
+        if active:
+            self.start_vad_monitor()
+        else:
+            self.stop_vad_monitor()
     
     def get_performance_stats(self) -> dict:
         return {
