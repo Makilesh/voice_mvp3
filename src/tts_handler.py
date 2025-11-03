@@ -1,16 +1,18 @@
-# tts_handler.py - FULL-DUPLEX FIXED VERSION
+# tts_handler.py - FULL-DUPLEX FIXED VERSION with Cartesia AI Integration
 import os
 import logging
 import time
 import threading
 import warnings
 from RealtimeTTS import SystemEngine, TextToAudioStream
+from cartesia_tts_engine import CartesiaTTSEngine
 
 import os
 import logging
 import time
 import threading
 from RealtimeTTS import SystemEngine, TextToAudioStream
+from cartesia_tts_engine import CartesiaTTSEngine
 
 # Configure logging
 logging.basicConfig(
@@ -23,10 +25,29 @@ logger = logging.getLogger(__name__)
 class TTSHandler:
     """TTS with <150ms barge-in using continuous STT monitoring."""
     
-    def __init__(self, stt_handler=None):
+    def __init__(self, stt_handler=None, use_cartesia=None):
         try:
-            self.engine = SystemEngine()
-            self.stream = TextToAudioStream(self.engine)
+            # Check if we should use Cartesia AI
+            self.use_cartesia = use_cartesia if use_cartesia is not None else (
+                os.getenv('USE_CARTESIA_TTS', 'false').lower() == 'true'
+            )
+            
+            if self.use_cartesia:
+                # Initialize Cartesia AI engine
+                self.cartesia_engine = CartesiaTTSEngine(
+                    api_key=os.getenv('CARTESIA_API_KEY'),
+                    voice_id=os.getenv('CARTESIA_VOICE_ID', 'brooke'),
+                    model=os.getenv('CARTESIA_MODEL', 'sonic-english')
+                )
+                self.engine = None
+                self.stream = None
+                logger.info("🎤 TTS Handler initialized with Cartesia AI (ultra-low latency)")
+            else:
+                # Initialize traditional RealtimeTTS engine
+                self.engine = SystemEngine()
+                self.stream = TextToAudioStream(self.engine)
+                self.cartesia_engine = None
+                logger.info("🎤 TTS Handler initialized with RealtimeTTS (AGGRESSIVE barge-in <150ms)")
             
             # CRITICAL: Reference to main STT (must be continuously listening)
             self.main_stt = stt_handler
@@ -44,10 +65,28 @@ class TTSHandler:
             self.last_seen_realtime_text = ""
             self.barge_in_sensitivity = 2  # Minimum chars to trigger (very sensitive)
             
-            logger.info("🎤 TTS Handler initialized with AGGRESSIVE barge-in (<150ms)")
+            # Test Cartesia connection if enabled
+            if self.use_cartesia and self.cartesia_engine:
+                if not self.cartesia_engine.test_connection():
+                    logger.warning("⚠️ Cartesia connection failed, falling back to RealtimeTTS")
+                    self.use_cartesia = False
+                    self.engine = SystemEngine()
+                    self.stream = TextToAudioStream(self.engine)
+                    self.cartesia_engine = None
+                else:
+                    logger.info("✅ Cartesia AI connection successful")
+                    
         except Exception as e:
             logger.error(f"❌ Error initializing TTS: {e}")
-            raise
+            # Fallback to traditional engine if Cartesia fails
+            if self.use_cartesia:
+                logger.info("🔄 Falling back to RealtimeTTS")
+                self.use_cartesia = False
+                self.engine = SystemEngine()
+                self.stream = TextToAudioStream(self.engine)
+                self.cartesia_engine = None
+            else:
+                raise
     
     # def _monitor_barge_in(self):
     #     """
@@ -191,7 +230,7 @@ class TTSHandler:
             logger.error(f"❌ Barge-in monitor crashed: {e}")
     
     def _play_with_monitoring(self, text: str):
-        """Play audio while monitoring for barge-in."""
+        """Play audio while monitoring for barge-in (traditional TTS)."""
         
         def play_audio():
             try:
@@ -214,7 +253,7 @@ class TTSHandler:
                     # try:
                     #     self.stream.play()
                     # except Exception as e:
-                    #         if not self.stop_event.is_set():
+                    #     if not self.stop_event.is_set():
                     #                 logger.error(f"❌ Playback error: {e}")
                         
             except Exception as e:
@@ -228,15 +267,89 @@ class TTSHandler:
         self.playback_thread = threading.Thread(target=play_audio, daemon=True)
         self.playback_thread.start()
     
-    def speak(self, text: str, voice: str = "default", emotive_tags: str = "", 
-              enable_barge_in: bool = True) -> str:
+    def _play_cartesia_with_monitoring(self, text: str, emotion: str = "neutral", speed: float = 1.0):
+        """Play Cartesia audio while monitoring for barge-in."""
+        
+        def play_cartesia():
+            try:
+                with self.state_lock:
+                    self.is_playing = True
+                    self.barge_in_detected = False
+                self.stop_event.clear()
+                
+                # CRITICAL: Start monitor BEFORE audio starts
+                monitor_thread = threading.Thread(target=self._monitor_barge_in, daemon=True)
+                monitor_thread.start()
+                
+                # Brief delay to ensure monitor is active
+                time.sleep(0.02)
+                
+                # Play Cartesia audio with streaming support
+                if self.cartesia_engine:
+                    self.cartesia_engine.play_streaming(
+                        text=text,
+                        enable_interrupt=self.is_barge_in_enabled,
+                        emotion=emotion,
+                        speed=speed
+                    )
+                        
+            except Exception as e:
+                logger.error(f"❌ Cartesia playback thread error: {e}")
+            finally:
+                with self.state_lock:
+                    self.is_playing = False
+                self.stop_event.clear()
+        
+        # Start Cartesia playback in daemon thread
+        self.playback_thread = threading.Thread(target=play_cartesia, daemon=True)
+        self.playback_thread.start()
+    
+    def speak(self, text: str, voice: str = "default", emotive_tags: str = "",
+              enable_barge_in: bool = True, emotion: str = "neutral",
+              speed: float = 1.0) -> str:
         """Speak with instant barge-in detection."""
         try:
-            if not self.engine or not self.stream:
-                raise ValueError("TTS not initialized")
+            if self.use_cartesia and self.cartesia_engine:
+                return self._speak_cartesia(text, enable_barge_in, emotion, speed)
+            else:
+                return self._speak_traditional(text, voice, emotive_tags, enable_barge_in)
+        except Exception as e:
+            logger.error(f"❌ TTS error: {e}")
+            return ""
+    
+    def _speak_cartesia(self, text: str, enable_barge_in: bool = True,
+                       emotion: str = "neutral", speed: float = 1.0) -> str:
+        """Speak using Cartesia AI with streaming support."""
+        try:
+            if not self.cartesia_engine:
+                raise ValueError("Cartesia TTS not initialized")
             
             self.is_barge_in_enabled = enable_barge_in
-            logger.info(f"🗣 Speaking: {text[:50]}... (barge-in: {enable_barge_in})")
+            logger.info(f"🗣 Cartesia Speaking: {text[:50]}... (barge-in: {enable_barge_in}, emotion: {emotion})")
+            
+            # CRITICAL: Clear STT real-time buffer before speaking
+            if self.main_stt:
+                self.main_stt.clear_realtime_text()
+            
+            # Start Cartesia streaming playback with monitoring
+            self._play_cartesia_with_monitoring(text, emotion, speed)
+            
+            return "cartesia_streaming"
+            
+        except Exception as e:
+            logger.error(f"❌ Cartesia TTS error: {e}")
+            # Fallback to traditional TTS
+            return self._speak_traditional(text, "default", "", enable_barge_in)
+    
+    def _speak_traditional(self, text: str, voice: str = "default",
+                          emotive_tags: str = "", enable_barge_in: bool = True) -> str:
+        """Speak using traditional RealtimeTTS."""
+        try:
+            if not self.engine or not self.stream:
+                raise ValueError("Traditional TTS not initialized")
+            
+            self.is_barge_in_enabled = enable_barge_in
+            logger.info(f"🗣 Traditional Speaking: {text[:50]}... (barge-in: {enable_barge_in})")
             
             if emotive_tags:
                 text = f"{text} {emotive_tags}"
@@ -256,7 +369,7 @@ class TTSHandler:
             return "audio_playing"
             
         except Exception as e:
-            logger.error(f"❌ TTS error: {e}")
+            logger.error(f"❌ Traditional TTS error: {e}")
             return ""
     
     def wait_for_completion(self, timeout: float = 30.0) -> bool:
@@ -266,17 +379,12 @@ class TTSHandler:
             
             while True:
                 with self.state_lock:
-                    # if not self.is_playing:
-                    #     was_interrupted = self.barge_in_detected
-                    #     if was_interrupted:
-                    #         logger.info("✅ Playback interrupted by user")
-                    #     return not was_interrupted
-                    
-                    # if self.barge_in_detected:
-                    #     return False
-                    
                     if not self.is_playing:
-                        return True
+                        was_interrupted = self.barge_in_detected
+                        if was_interrupted:
+                            logger.info("✅ Playback interrupted by user")
+                        return not was_interrupted
+                    
                     if self.barge_in_detected:
                         return False
                 
@@ -298,9 +406,15 @@ class TTSHandler:
     def stop_playback(self):
         """Immediately stop TTS playback."""
         try:
-            if self.stream:
+            if self.use_cartesia and self.cartesia_engine:
+                # Stop Cartesia playback
+                self.cartesia_engine.stop_playback()
+                logger.info("🛑 Cartesia TTS aborted on voice detect")
+            elif self.stream:
+                # Stop traditional TTS playback
                 self.stream.stop()
-                logger.info("🛑 TTS aborted on voice detect")
+                logger.info("🛑 Traditional TTS aborted on voice detect")
+            
             with self.state_lock:
                 self.barge_in_detected = True
             self.stop_event.set()
@@ -316,16 +430,28 @@ class TTSHandler:
                 self.is_playing = False
             self.stop_event.set()
             
-            if hasattr(self, 'stream') and self.stream:
+            # Shutdown Cartesia engine if active
+            if self.use_cartesia and hasattr(self, 'cartesia_engine') and self.cartesia_engine:
                 try:
-                    self.stream.stop()
-                except Exception:
-                    pass
-                self.stream = None
+                    self.cartesia_engine.cleanup()
+                except Exception as e:
+                    logger.warning(f"Cartesia cleanup error: {e}")
+                self.cartesia_engine = None
+                logger.info("✅ Cartesia TTS shutdown complete")
             
-            if hasattr(self, 'engine'):
-                self.engine = None
+            # Shutdown traditional TTS engine if active
+            if not self.use_cartesia:
+                if hasattr(self, 'stream') and self.stream:
+                    try:
+                        self.stream.stop()
+                    except Exception:
+                        pass
+                    self.stream = None
+                
+                if hasattr(self, 'engine'):
+                    self.engine = None
+                
+                logger.info("✅ Traditional TTS shutdown complete")
             
-            logger.info("✅ TTS shutdown complete")
         except Exception as e:
             logger.error(f"❌ Shutdown error: {e}")
