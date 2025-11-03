@@ -111,11 +111,15 @@ class CartesiaTTSEngine:
         self.state_lock = threading.Lock()
         self.stop_event = threading.Event()
         
-        # Audio streaming queue (WebSocket → PyAudio)
-        self.audio_queue: queue.Queue = queue.Queue(maxsize=50)
+        # Audio streaming queue (WebSocket → PyAudio) - Increased for high-speed streaming
+        self.audio_queue: queue.Queue = queue.Queue(maxsize=100)
         
         # Barge-in callback (set by TTS handler)
         self.barge_in_callback: Optional[Callable[[], bool]] = None
+        
+        # Persistent audio consumer thread
+        self.consumer_thread: Optional[threading.Thread] = None
+        self.consumer_running = False
         
         logger.info(
             f"🎤 Cartesia TTS Engine initialized "
@@ -132,6 +136,10 @@ class CartesiaTTSEngine:
                 
                 # Test connection
                 await self._test_connection()
+                
+            # Start persistent audio consumer
+            if not self.consumer_running:
+                self._start_audio_consumer()
                 
         except Exception as e:
             logger.error(f"❌ Cartesia initialization failed: {e}")
@@ -171,9 +179,15 @@ class CartesiaTTSEngine:
         """Cleanup PyAudio resources."""
         try:
             if self.audio_stream:
-                if self.audio_stream.is_active():
-                    self.audio_stream.stop_stream()
-                self.audio_stream.close()
+                try:
+                    if self.audio_stream.is_active():
+                        self.audio_stream.stop_stream()
+                except:
+                    pass
+                try:
+                    self.audio_stream.close()
+                except:
+                    pass
                 self.audio_stream = None
             logger.debug("🧹 Audio output cleaned up")
         except Exception as e:
@@ -238,64 +252,122 @@ class CartesiaTTSEngine:
                     latency_ms = (time.time() - start_time) * 1000
                     logger.info(f"⚡ First audio chunk: {latency_ms:.0f}ms")
                 
-                # Queue for playback (non-blocking)
+                # Queue for playback (blocking with timeout to apply backpressure)
                 try:
-                    self.audio_queue.put_nowait(audio_bytes)
+                    # Use blocking put with timeout instead of dropping chunks
+                    self.audio_queue.put(audio_bytes, timeout=1.0)
                     chunk_count += 1
                 except queue.Full:
-                    logger.warning("⚠️ Audio queue full, dropping chunk")
+                    logger.warning("⚠️ Audio queue timeout, chunk may be delayed")
+                    # Try one more time with longer timeout
+                    try:
+                        self.audio_queue.put(audio_bytes, timeout=2.0)
+                        chunk_count += 1
+                    except queue.Full:
+                        logger.warning("⚠️ Audio queue full after retry, dropping chunk")
             
             # Signal end of stream
-            self.audio_queue.put_nowait(None)
+            self.audio_queue.put(None, timeout=1.0)
             
             total_time = (time.time() - start_time) * 1000
             logger.info(f"✅ Stream complete: {chunk_count} chunks, {total_time:.0f}ms")
             
         except Exception as e:
             logger.error(f"❌ Streaming error: {e}")
-            self.audio_queue.put_nowait(None)  # Signal error
+            # Signal error with non-blocking put to avoid hanging
+            try:
+                self.audio_queue.put(None, timeout=0.5)
+            except:
+                pass
             raise
     
-    def _audio_consumer(self):
+    def _start_audio_consumer(self):
+        """Start persistent audio consumer thread."""
+        if not self.consumer_running:
+            self.consumer_running = True
+            self.consumer_thread = threading.Thread(
+                target=self._audio_consumer_loop,
+                daemon=True
+            )
+            self.consumer_thread.start()
+            logger.debug("🔊 Audio consumer thread started")
+    
+    def _audio_consumer_loop(self):
         """
-        Consume audio chunks from queue and play via PyAudio.
-        Runs in separate thread.
+        Persistent audio consumer that runs continuously.
+        Processes chunks from queue and plays via PyAudio.
         """
         try:
             self._init_audio_output()
+            logger.debug("🔊 Audio consumer loop active")
             
-            while not self.stop_event.is_set():
+            while self.consumer_running:
                 try:
-                    # Get audio chunk (blocking with timeout)
+                    # Get audio chunk with timeout
                     audio_bytes = self.audio_queue.get(timeout=0.1)
                     
-                    if audio_bytes is None:  # End of stream signal
-                        break
+                    if audio_bytes is None:  # End of current stream
+                        with self.state_lock:
+                            self.state = PlaybackState.IDLE
+                        continue
                     
-                    # Check barge-in before playback
+                    if audio_bytes == "STOP":  # Stop signal
+                        # Clear remaining queue
+                        while not self.audio_queue.empty():
+                            try:
+                                self.audio_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        with self.state_lock:
+                            self.state = PlaybackState.STOPPED
+                        continue
+                    
+                    # Check barge-in before playback (every chunk for <50ms response)
                     if self.barge_in_callback and self.barge_in_callback():
-                        logger.info("🛑 Barge-in during playback")
+                        logger.info("🛑 Barge-in during playback - clearing queue")
                         self.stop_event.set()
-                        break
+                        # Clear remaining audio queue
+                        while not self.audio_queue.empty():
+                            try:
+                                self.audio_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        with self.state_lock:
+                            self.state = PlaybackState.STOPPED
+                        continue
+                    
+                    # Check stop event
+                    if self.stop_event.is_set():
+                        # Clear queue
+                        while not self.audio_queue.empty():
+                            try:
+                                self.audio_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        with self.state_lock:
+                            self.state = PlaybackState.STOPPED
+                        continue
                     
                     # Play audio chunk
                     if self.audio_stream and self.audio_stream.is_active():
-                        self.audio_stream.write(audio_bytes)
+                        try:
+                            self.audio_stream.write(audio_bytes)
+                        except Exception as write_err:
+                            logger.warning(f"⚠️ Audio write error: {write_err}")
+                            continue
                     
                 except queue.Empty:
                     continue
                 except Exception as e:
-                    logger.error(f"❌ Playback error: {e}")
-                    break
+                    logger.error(f"❌ Consumer loop error: {e}")
+                    continue
             
-            logger.debug("🔇 Audio consumer stopped")
+            logger.debug("🔇 Audio consumer loop stopped")
             
         except Exception as e:
             logger.error(f"❌ Audio consumer error: {e}")
         finally:
             self._cleanup_audio_output()
-            with self.state_lock:
-                self.state = PlaybackState.STOPPED
     
     async def synthesize_and_play(
         self,
@@ -306,14 +378,20 @@ class CartesiaTTSEngine:
     ) -> bool:
         """
         Synthesize and play audio with barge-in support.
+        NON-BLOCKING: Returns immediately after starting stream.
         
         Returns:
-            True if completed, False if interrupted
+            True if started successfully
         """
         try:
             # Initialize if needed
             if not self.client:
                 await self.initialize()
+            
+            # Stop any ongoing playback first
+            if self.state != PlaybackState.IDLE:
+                self.stop_playback()
+                await asyncio.sleep(0.05)  # Brief cleanup pause
             
             # Reset state
             self.stop_event.clear()
@@ -327,30 +405,17 @@ class CartesiaTTSEngine:
                 except queue.Empty:
                     break
             
-            # Start audio consumer thread
-            consumer_thread = threading.Thread(
-                target=self._audio_consumer,
-                daemon=True
-            )
-            consumer_thread.start()
-            
-            # Stream audio from Cartesia (producer)
+            # Stream audio from Cartesia (this puts chunks in queue)
             await self._stream_audio_from_websocket(
                 text=text,
                 voice_config=voice_config,
                 audio_config=audio_config
             )
             
-            # Wait for consumer to finish
-            consumer_thread.join(timeout=10.0)
+            # Signal end of stream (consumer will set state to IDLE)
+            self.audio_queue.put(None, timeout=0.5)
             
-            # Check if interrupted
-            was_interrupted = self.stop_event.is_set()
-            
-            with self.state_lock:
-                self.state = PlaybackState.IDLE
-            
-            return not was_interrupted
+            return True
             
         except Exception as e:
             logger.error(f"❌ Synthesis error: {e}")
@@ -358,18 +423,30 @@ class CartesiaTTSEngine:
                 self.state = PlaybackState.IDLE
             return False
     
+    async def stop(self):
+        """Async stop method for compatibility with TTS handler."""
+        self.stop_playback()
+    
     def stop_playback(self):
         """Immediately stop playback."""
         try:
             logger.info("🛑 Stopping Cartesia playback")
             self.stop_event.set()
             
-            # Clear queue
-            while not self.audio_queue.empty():
+            # Send STOP signal to consumer
+            try:
+                self.audio_queue.put("STOP", timeout=0.1)
+            except queue.Full:
+                # Clear queue and try again
+                while not self.audio_queue.empty():
+                    try:
+                        self.audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
                 try:
-                    self.audio_queue.get_nowait()
-                except queue.Empty:
-                    break
+                    self.audio_queue.put("STOP", timeout=0.1)
+                except:
+                    pass
             
             with self.state_lock:
                 self.state = PlaybackState.STOPPED
@@ -398,21 +475,34 @@ class CartesiaTTSEngine:
     async def cleanup(self):
         """Cleanup resources."""
         try:
+            # Stop consumer loop
+            self.consumer_running = False
             self.stop_playback()
+            
+            # Wait for consumer thread
+            if self.consumer_thread and self.consumer_thread.is_alive():
+                self.consumer_thread.join(timeout=2.0)
+            
             self._cleanup_audio_output()
             
             if self.pyaudio_instance:
-                self.pyaudio_instance.terminate()
+                try:
+                    self.pyaudio_instance.terminate()
+                except:
+                    pass
                 self.pyaudio_instance = None
             
             if self.client:
-                await self.client.close()
+                try:
+                    await self.client.close()
+                except:
+                    pass
                 self.client = None
             
             logger.info("✅ Cartesia TTS cleanup complete")
             
         except Exception as e:
-            logger.error(f"Cleanup error: {e}")
+            logger.warning(f"Cartesia cleanup error: {e}")
 
 
 # Voice ID Constants
